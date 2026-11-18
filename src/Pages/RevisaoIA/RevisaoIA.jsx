@@ -1,9 +1,7 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { Link, useLocation } from "react-router-dom";
+import { reformularReclamacao } from "../../api.js";
 import "./RevisaoIA.css";
-
-// Controle de disponibilidade da futura integração com a API
-const INTEGRACAO_API_DISPONIVEL = false;
 
 const STATUS_REVISAO = {
   EM_ANALISE: "em_analise",
@@ -18,11 +16,16 @@ const ROTULOS_STATUS = {
 };
 
 function RevisaoIA() {
-  const [reclamacoes, setReclamacoes] = useState([]);
-  const [reclamacaoAtivaId, setReclamacaoAtivaId] = useState("");
-
-  const [instrucoesIaPadrao, setInstrucoesIaPadrao] = useState("");
-  const [observacoesPadrao, setObservacoesPadrao] = useState("");
+  const { state } = useLocation();
+  const reformulacaoPublica = !state?.reclamacao || state.reformulacaoPublica === true;
+  const [rascunho, setRascunho] = useState(state?.reclamacao?.textoOriginal ?? "");
+  const iniciouGeracao = useRef(false);
+  const [reclamacoes, setReclamacoes] = useState(() =>
+    state?.reclamacao ? [state.reclamacao] : []
+  );
+  const [reclamacaoAtivaId, setReclamacaoAtivaId] = useState(state?.reclamacao?.id ?? "");
+  const [gerando, setGerando] = useState(false);
+  const [erroGeracao, setErroGeracao] = useState(null);
 
   const [modoEdicaoManual, setModoEdicaoManual] = useState(false);
   const [textoEmEdicao, setTextoEmEdicao] = useState("");
@@ -30,48 +33,28 @@ function RevisaoIA() {
   const reclamacaoAtiva =
     reclamacoes.find((r) => r.id === reclamacaoAtivaId) || null;
 
-  const textoSugeridoAtual = reclamacaoAtiva?.textoSugerido || "";
-  const statusSugestaoAtual = reclamacaoAtiva?.status || null;
-  const possuiSugestao = Boolean(
-    reclamacaoAtiva && textoSugeridoAtual.trim().length > 0
-  );
+  const textoOriginal = reformulacaoPublica ? rascunho : reclamacaoAtiva?.textoOriginal;
+  const [sugestaoPublica, setSugestaoPublica] = useState("");
+  const [sugestaoRecusada, setSugestaoRecusada] = useState(false);
+  const textoSugeridoAtual = reformulacaoPublica ? sugestaoPublica : reclamacaoAtiva?.textoSugerido || "";
+  const statusSugestaoAtual = reformulacaoPublica
+    ? (sugestaoRecusada ? STATUS_REVISAO.REJEITADA : null)
+    : reclamacaoAtiva?.status || null;
+  const possuiSugestao = Boolean(textoSugeridoAtual.trim());
   const podeGerarSugestao =
-    INTEGRACAO_API_DISPONIVEL && Boolean(reclamacaoAtiva);
+    Boolean(textoOriginal?.trim()) && textoOriginal.length <= 5000 && !gerando && !modoEdicaoManual;
 
-  const valorInstrucoesIa = reclamacaoAtiva
-    ? reclamacaoAtiva.instrucoesIa ?? ""
-    : instrucoesIaPadrao;
-
-  const valorObservacoesRevisor = reclamacaoAtiva
-    ? reclamacaoAtiva.observacoesRevisor ?? ""
-    : observacoesPadrao;
+  const valorObservacoesRevisor = reclamacaoAtiva?.observacoesRevisor ?? "";
 
   const selecionarReclamacao = (novoId) => {
+    setErroGeracao(null);
     setModoEdicaoManual(false);
     setTextoEmEdicao("");
     setReclamacaoAtivaId(novoId);
   };
 
-  const atualizarInstrucoesIa = (novoValor) => {
-    if (!reclamacaoAtiva) {
-      setInstrucoesIaPadrao(novoValor);
-      return;
-    }
-
-    setReclamacoes((anteriores) =>
-      anteriores.map((rec) =>
-        rec.id === reclamacaoAtiva.id
-          ? { ...rec, instrucoesIa: novoValor }
-          : rec
-      )
-    );
-  };
-
   const atualizarObservacoesRevisor = (novoValor) => {
-    if (!reclamacaoAtiva) {
-      setObservacoesPadrao(novoValor);
-      return;
-    }
+    if (!reclamacaoAtiva) return;
 
     setReclamacoes((anteriores) =>
       anteriores.map((rec) =>
@@ -167,21 +150,46 @@ function RevisaoIA() {
     setTextoEmEdicao("");
   };
 
-  // Quando a integração estiver ativa, a nova sugestão substitui a anterior.
-  // Se o campo de instruções estiver vazio, o backend utilizará apenas suas instruções padrão.
-  const gerarNovaSugestao = () => {
+  const gerarNovaSugestao = async () => {
     if (!podeGerarSugestao) return;
 
-    const instrucaoAdicional = valorInstrucoesIa.trim();
-    const dadosRequisicao = {
-      reclamacaoId: reclamacaoAtiva.id,
-      textoOriginal: reclamacaoAtiva.textoOriginal,
-      usarApenasInstrucoesPadrao: instrucaoAdicional.length === 0,
-      ...(instrucaoAdicional.length > 0 ? { instrucaoAdicional } : {}),
-    };
+    const id = reclamacaoAtiva?.id;
+    setGerando(true);
+    setErroGeracao(null);
 
-    if (!dadosRequisicao) return;
+    try {
+      const textoSugerido = await reformularReclamacao(textoOriginal);
+      if (reformulacaoPublica) {
+        setSugestaoPublica(textoSugerido);
+        setSugestaoRecusada(false);
+        return;
+      }
+      setReclamacoes((anteriores) =>
+        anteriores.map((rec) =>
+          rec.id === id
+            ? { ...rec, textoSugerido, status: STATUS_REVISAO.EM_ANALISE, foiEditada: false }
+            : rec
+        )
+      );
+    } catch (error) {
+      setErroGeracao(
+        error instanceof TypeError ? "Não foi possível conectar ao servidor." : error.message
+      );
+    } finally {
+      setGerando(false);
+    }
   };
+
+  const gerarPrimeiraSugestao = useEffectEvent(() => {
+    if (!reformulacaoPublica && !possuiSugestao) void gerarNovaSugestao();
+  });
+
+  useEffect(() => {
+    if (!iniciouGeracao.current) {
+      iniciouGeracao.current = true;
+      gerarPrimeiraSugestao();
+    }
+  }, []);
 
   return (
     <div className="revisao-ia-page">
@@ -192,12 +200,13 @@ function RevisaoIA() {
         </h1>
 
         <div className="revisao-topo-acoes">
-          {reclamacoes.length > 0 && (
+          {!reformulacaoPublica && reclamacoes.length > 0 && (
             <select
               id="seletor-reclamacao"
               className="revisao-select-compacto"
               aria-label="Selecionar reclamação"
               value={reclamacaoAtiva ? reclamacaoAtiva.id : ""}
+              disabled={gerando}
               onChange={(e) => selecionarReclamacao(e.target.value)}
             >
               {reclamacoes.map((rec) => (
@@ -208,8 +217,11 @@ function RevisaoIA() {
             </select>
           )}
 
-          <Link to="/reclamacao" className="revisao-link-voltar">
-            ← Reclamações
+          <Link
+            to="/"
+            className="revisao-link-voltar"
+          >
+            ← Início
           </Link>
         </div>
       </header>
@@ -232,7 +244,23 @@ function RevisaoIA() {
           </div>
 
           <div className="caixa-leitura caixa-original">
-            {reclamacaoAtiva?.textoOriginal ? (
+            {reformulacaoPublica ? (
+              <textarea
+                className="revisao-textarea textarea-edicao"
+                aria-labelledby="titulo-reclamacao-original"
+                placeholder="Descreva o ocorrido."
+                rows={6}
+                maxLength={5000}
+                value={rascunho}
+                readOnly={gerando}
+                onChange={(event) => {
+                  setRascunho(event.target.value);
+                  setSugestaoPublica("");
+                  setSugestaoRecusada(false);
+                  setErroGeracao(null);
+                }}
+              />
+            ) : reclamacaoAtiva?.textoOriginal ? (
               <p className="texto-conteudo">{reclamacaoAtiva.textoOriginal}</p>
             ) : (
               <p className="texto-estado-vazio" role="status">
@@ -242,28 +270,7 @@ function RevisaoIA() {
           </div>
         </section>
 
-        {/* 2. Instruções para a IA (opcional) */}
-        <section
-          className="revisao-bloco bloco-instrucoes"
-          aria-labelledby="titulo-instrucoes-ia"
-        >
-          <div className="bloco-cabecalho">
-            <label htmlFor="campo-instrucoes-ia" id="titulo-instrucoes-ia" className="bloco-titulo">
-              Instruções para a IA (opcional)
-            </label>
-          </div>
-
-          <textarea
-            id="campo-instrucoes-ia"
-            className="revisao-textarea"
-            rows={2}
-            placeholder="Ex.: Retire os palavrões, mantenha a mensagem em primeira pessoa e preserve a insatisfação."
-            value={valorInstrucoesIa}
-            onChange={(e) => atualizarInstrucoesIa(e.target.value)}
-          />
-        </section>
-
-        {/* 3. Sugestão da IA */}
+        {/* 2. Sugestão da IA */}
         <section
           className="revisao-bloco bloco-sugestao"
           aria-labelledby="titulo-sugestao-ia"
@@ -281,7 +288,7 @@ function RevisaoIA() {
             >
               {statusSugestaoAtual
                 ? ROTULOS_STATUS[statusSugestaoAtual]
-                : "Aguardando reformulação"}
+                : gerando ? "Reformulando…" : possuiSugestao ? "Sugestão gerada" : "Aguardando reformulação"}
             </span>
           </div>
 
@@ -315,7 +322,7 @@ function RevisaoIA() {
                   </div>
                 </div>
               ) : (
-                <p className="texto-conteudo">{textoSugeridoAtual}</p>
+                <p className="texto-conteudo" role="status">{textoSugeridoAtual}</p>
               )
             ) : (
               <p className="texto-estado-vazio" role="status">
@@ -325,48 +332,52 @@ function RevisaoIA() {
           </div>
         </section>
 
-        {/* 4. Botões de ação */}
+        {/* 3. Botões de ação */}
         <section
           className="revisao-bloco bloco-acoes"
-          aria-label="Ações do revisor"
+          aria-label={reformulacaoPublica ? "Ações de reformulação" : "Ações do revisor"}
         >
           <div className="barra-acoes-revisor">
-            <button
-              type="button"
-              className={`btn-revisao btn-primario ${
-                statusSugestaoAtual === STATUS_REVISAO.APROVADA
-                  ? "btn-ativo"
-                  : ""
-              }`}
-              onClick={aprovarSugestao}
-              disabled={!possuiSugestao}
-            >
-              ✓ Aprovar sugestão
-            </button>
+            {!reformulacaoPublica && (
+              <>
+                <button
+                  type="button"
+                  className={`btn-revisao btn-primario ${
+                    statusSugestaoAtual === STATUS_REVISAO.APROVADA
+                      ? "btn-ativo"
+                      : ""
+                  }`}
+                  onClick={aprovarSugestao}
+                  disabled={!possuiSugestao || gerando}
+                >
+                  ✓ Aprovar sugestão
+                </button>
 
-            <button
-              type="button"
-              className={`btn-revisao btn-secundario ${
-                statusSugestaoAtual === STATUS_REVISAO.REJEITADA
-                  ? "btn-ativo"
-                  : ""
-              }`}
-              onClick={rejeitarSugestao}
-              disabled={!possuiSugestao}
-            >
-              ✕ Rejeitar sugestão
-            </button>
+                <button
+                  type="button"
+                  className={`btn-revisao btn-secundario ${
+                    statusSugestaoAtual === STATUS_REVISAO.REJEITADA
+                      ? "btn-ativo"
+                      : ""
+                  }`}
+                  onClick={rejeitarSugestao}
+                  disabled={!possuiSugestao || gerando}
+                >
+                  ✕ Rejeitar sugestão
+                </button>
 
-            <button
-              type="button"
-              className={`btn-revisao btn-secundario ${
-                modoEdicaoManual ? "btn-ativo" : ""
-              }`}
-              onClick={iniciarOuSalvarEdicaoManual}
-              disabled={!possuiSugestao}
-            >
-              {modoEdicaoManual ? "✓ Salvar edição" : "✎ Editar sugestão"}
-            </button>
+                <button
+                  type="button"
+                  className={`btn-revisao btn-secundario ${
+                    modoEdicaoManual ? "btn-ativo" : ""
+                  }`}
+                  onClick={iniciarOuSalvarEdicaoManual}
+                  disabled={!possuiSugestao || gerando}
+                >
+                  {modoEdicaoManual ? "✓ Salvar edição" : "✎ Editar sugestão"}
+                </button>
+              </>
+            )}
 
             <button
               type="button"
@@ -374,35 +385,49 @@ function RevisaoIA() {
               onClick={gerarNovaSugestao}
               disabled={!podeGerarSugestao}
             >
-              ↻ Gerar nova sugestão
+              {gerando ? "Gerando sugestão…" : possuiSugestao ? "Gerar nova sugestão" : reformulacaoPublica ? "Enviar para a IA" : "Gerar sugestão"}
             </button>
+            {reformulacaoPublica && (
+              <button
+                type="button"
+                className="btn-revisao btn-secundario"
+                onClick={() => setSugestaoRecusada(true)}
+                disabled={!possuiSugestao || gerando || sugestaoRecusada}
+              >
+                Recusar sugestão
+              </button>
+            )}
           </div>
+          {gerando && <p role="status">Aguardando a reformulação da IA.</p>}
+          {erroGeracao && <p role="alert">{erroGeracao}</p>}
         </section>
 
-        {/* 5. Observações do revisor (opcional) */}
-        <section
-          className="revisao-bloco bloco-observacoes"
-          aria-labelledby="titulo-observacoes-revisor"
-        >
-          <div className="bloco-cabecalho">
-            <label
-              htmlFor="campo-observacoes-revisor"
-              id="titulo-observacoes-revisor"
-              className="bloco-titulo"
-            >
-              Observações do revisor (opcional)
-            </label>
-          </div>
+        {!reformulacaoPublica && (
+          <section
+            className="revisao-bloco bloco-observacoes"
+            aria-labelledby="titulo-observacoes-revisor"
+          >
+            <div className="bloco-cabecalho">
+              <label
+                htmlFor="campo-observacoes-revisor"
+                id="titulo-observacoes-revisor"
+                className="bloco-titulo"
+              >
+                Observações do revisor (opcional)
+              </label>
+            </div>
 
-          <textarea
-            id="campo-observacoes-revisor"
-            className="revisao-textarea"
-            rows={2}
-            placeholder="Registre observações internas sobre esta revisão..."
-            value={valorObservacoesRevisor}
-            onChange={(e) => atualizarObservacoesRevisor(e.target.value)}
-          />
-        </section>
+            <textarea
+              id="campo-observacoes-revisor"
+              className="revisao-textarea"
+              rows={2}
+              placeholder="Registre observações internas sobre esta revisão..."
+              disabled={!reclamacaoAtiva}
+              value={valorObservacoesRevisor}
+              onChange={(e) => atualizarObservacoesRevisor(e.target.value)}
+            />
+          </section>
+        )}
       </main>
     </div>
   );
